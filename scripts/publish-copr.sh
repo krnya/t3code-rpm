@@ -75,10 +75,12 @@ if [[ $mode == promote ]]; then
     [[ -s "$out/$rpmname.rpm" && -s "$out/copr-build.json" ]]
     id=$(jq -er .id "$out/copr-build.json")
     [[ $id =~ ^[0-9]+$ ]]
+    expected_sha=$(sha256sum < "$out/$rpmname.rpm")
     package_in_repo() {
-        local location
+        local location published_sha
         location=$(rpm_location "$repo") || return 1
-        get "$location" 600 > "$scratch/live.rpm" && cmp -s "$scratch/live.rpm" "$out/$rpmname.rpm"
+        published_sha=$(get "$location" 600 | sha256sum) || return 1
+        [[ $published_sha == "$expected_sha" ]]
     }
     if ! package_in_repo; then
         "${copr[@]}" regenerate-repos "$project"

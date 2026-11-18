@@ -29,7 +29,15 @@ config.read(sys.argv[1])
 assert config["copr-cli"]["copr_url"].rstrip("/") == "https://copr.fedorainfracloud.org"
 PY
 copr=(copr-cli --config "$scratch/config")
-get() { curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --max-time 90 "$1"; }
+get() {
+    local url=$1 timeout=${2:-90} status
+    curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 20 \
+        --retry 3 --max-time "$timeout" "$url" || {
+        status=$?
+        printf 'COPR request failed for %s\n' "$url" >&2
+        return "$status"
+    }
+}
 copr_data=$(get "$api/project?$query")
 repo=$(jq -er --arg chroot "$chroot" '.chroot_repos[$chroot]' <<<"$copr_data")
 [[ $repo == "$magic"* ]] || { echo 'Unexpected COPR download host' >&2; exit 1; }
@@ -51,20 +59,26 @@ srpm="$verified/t3code-$evr.src.rpm"
 rpmname="t3code-$evr.x86_64"
 [[ -s $srpm ]]
 
+rpm_location() {
+    local repository=$1 locations location
+    locations=$(dnf -q --refresh --repofrompath="t3code-verify,$repository" --repo=t3code-verify \
+        repoquery --location "$rpmname" 2>/dev/null) || return 1
+    while IFS= read -r location; do
+        [[ $location == "$magic"* && $location == */"$rpmname.rpm" ]] || continue
+        printf '%s\n' "$location"
+        return 0
+    done <<<"$locations"
+    return 1
+}
+
 if [[ $mode == promote ]]; then
     [[ -s "$out/$rpmname.rpm" && -s "$out/copr-build.json" ]]
     id=$(jq -er .id "$out/copr-build.json")
     [[ $id =~ ^[0-9]+$ ]]
     package_in_repo() {
-        locations=$(dnf -q --refresh --repofrompath="t3code-verify,$repo" --repo=t3code-verify \
-            repoquery --location "$rpmname" 2>/dev/null) || return 1
-        for location in $locations; do
-            [[ $location == "$magic"* && $location == */"$rpmname.rpm" ]] || continue
-            if get "$location" > "$scratch/live.rpm" && cmp -s "$scratch/live.rpm" "$out/$rpmname.rpm"; then
-                return 0
-            fi
-        done
-        return 1
+        local location
+        location=$(rpm_location "$repo") || return 1
+        get "$location" 600 > "$scratch/live.rpm" && cmp -s "$scratch/live.rpm" "$out/$rpmname.rpm"
     }
     if ! package_in_repo; then
         "${copr[@]}" regenerate-repos "$project"
@@ -98,6 +112,10 @@ matches=$(jq -s --arg version "$evr" --arg plain "$version-$revision" --arg chro
                 (.source_package.version == $version or .source_package.version == $plain))
         | select(.state != "failed" and .state != "canceled" and .state != "skipped")]
 ' <<<"$history")
+if [[ $(jq 'length' <<<"$matches") -gt 1 ]]; then
+    echo "Multiple COPR builds match $rpmname. Reconcile them before publishing." >&2
+    exit 1
+fi
 id=$(jq -r '.[0].id // empty' <<<"$matches")
 if [[ -z $id ]]; then
     if jq -es 'any(.[]; (.source_package.name == null or .source_package.version == null)
@@ -128,7 +146,7 @@ done
 
 source_url=$(jq -er .source_package.url <<<"$build")
 [[ $source_url == "$magic"* ]]
-get "$source_url" > "$scratch/source.rpm"
+get "$source_url" 600 > "$scratch/source.rpm"
 digest_format='%{SHA256HEADER}:%{PAYLOADSHA256}'
 local_digests=$(rpm -qp --qf "$digest_format" "$srpm")
 [[ $local_digests =~ ^[0-9a-f]{64}:[0-9a-f]{64}$ ]]
@@ -137,15 +155,25 @@ local_digests=$(rpm -qp --qf "$digest_format" "$srpm")
     exit 1
 }
 result=$(get "$api/build-chroot?build_id=$id&chrootname=$chroot")
-rpmurl=$(jq -er 'select(.state == "succeeded").result_url' <<<"$result")
-[[ $rpmurl == "$magic"* ]]
-get "${rpmurl%/}/$rpmname.rpm" > "$out/$rpmname.rpm"
+jq -e '.state == "succeeded"' <<<"$result" >/dev/null
+# Pulp can publish the candidate to devel without a download at result_url.
+# Also check the public repo when resuming after metadata promotion.
+echo "Locating the signed RPM for COPR build $id"
+for ((attempt = 0; attempt < 12; attempt++)); do
+    if rpmurl=$(rpm_location "${repo%/}/devel/") || rpmurl=$(rpm_location "$repo"); then
+        if get "$rpmurl" 600 > "$scratch/candidate.rpm"; then break; fi
+    fi
+    sleep 10
+done
+(( attempt < 12 )) || { echo "COPR build $id has no downloadable RPM in repository metadata" >&2; exit 1; }
 get "${repo%/$chroot/}/pubkey.gpg" > "$scratch/pubkey.gpg"
 mkdir "$scratch/rpmdb"
 rpm --dbpath "$scratch/rpmdb" --import "$scratch/pubkey.gpg"
-signature=$(rpm --dbpath "$scratch/rpmdb" -Kv "$out/$rpmname.rpm")
+signature=$(rpm --dbpath "$scratch/rpmdb" -Kv "$scratch/candidate.rpm")
 printf '%s\n' "$signature"
 grep -Ei 'signature.*: OK' <<<"$signature"
-[[ $(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$out/$rpmname.rpm") == "$rpmname" ]]
+[[ $(rpm --dbpath "$scratch/rpmdb" -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' \
+    "$scratch/candidate.rpm") == "$rpmname" ]]
+mv -- "$scratch/candidate.rpm" "$out/$rpmname.rpm"
 jq -n --argjson build "$build" --argjson chroot "$result" --arg repo "$repo" \
     '$build + {chroot_result: $chroot, repository_url: $repo}' > "$out/copr-build.json"

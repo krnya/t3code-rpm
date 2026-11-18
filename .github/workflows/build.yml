@@ -1,0 +1,71 @@
+name: Build and test Fedora 45 RPMs
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rpm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Verify upstream source and build tools
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          mkdir -p .rpm-work
+          printf '%s\n' "$PLAN" > .rpm-work/plan.json
+          python3 scripts/prepare-source.py .rpm-work/plan.json .rpm-work/rpm
+      - name: Compile the desktop application and package RPM and SRPM
+        run: |
+          set -euo pipefail
+          docker build --target package-build -f packaging/Containerfile -t t3code-build packaging
+          mkdir -p .rpm-work/build-home
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/work/build-home \
+             -v "$PWD/.rpm-work:/work" -v "$PWD/scripts:/scripts:ro" t3code-build \
+             /scripts/package.sh /work/rpm /work/artifacts "$GITHUB_SHA"
+          rm -rf .rpm-work/rpm .rpm-work/build-home
+          docker image rm t3code-build
+      - name: Retrieve a lower RPM for the upgrade test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous=$(jq -r .previous .rpm-work/plan.json)
+          if [[ -n $previous ]]; then
+            gh release download "$previous" --pattern 't3code-*.x86_64.rpm' --dir .rpm-work/previous
+          fi
+      - name: Validate install, upgrade, launch, and removal
+        run: |
+          set -euo pipefail
+          docker build --target package-test -f packaging/Containerfile -t t3code-test packaging
+          version=$(jq -r .version .rpm-work/plan.json)
+          revision=$(jq -r .revision .rpm-work/plan.json)
+          package="/work/artifacts/t3code-$version-$revision.fc45.x86_64.rpm"
+          args=()
+          if [[ -d .rpm-work/previous ]]; then
+            for previous in .rpm-work/previous/*.rpm; do
+              args+=("/work/previous/${previous##*/}")
+            done
+          fi
+          # Chromium creates Linux namespaces inside this disposable test container.
+          docker run --rm --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+            -v "$PWD/.rpm-work:/work:ro" -v "$PWD/scripts:/scripts:ro" t3code-test \
+            /scripts/test-package.sh "$package" "$version" "$revision" "${args[@]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verified-fedora-45-rpm
+          path: .rpm-work/artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

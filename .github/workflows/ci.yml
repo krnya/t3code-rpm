@@ -1,0 +1,25 @@
+name: Packaging checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v
+          python3 -m compileall -q scripts
+          for file in scripts/*.sh; do bash -n "$file"; done
+          sh -n packaging/t3code
+          git diff --check

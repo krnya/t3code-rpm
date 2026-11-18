@@ -1,0 +1,19 @@
+FROM docker.io/library/fedora:45@sha256:53d138f25f6738257c78553d51369b662efc0e0eb1cd1556a2fe0ad5a115be88 AS base
+RUN dnf -y config-manager setopt fedora-cisco-openh264.enabled=0
+
+FROM base AS package-build
+RUN dnf -y --setopt=install_weak_deps=false install \
+      alsa-lib binutils cargo curl desktop-file-utils gcc gcc-c++ git-core gtk3 \
+      ImageMagick libsecret-devel make mesa-libgbm nss pkgconf-pkg-config python3 \
+      python3-pyyaml rpm-build rust unzip wayland-devel which xz \
+    && dnf clean all
+
+FROM base AS package-test
+RUN dnf -y --setopt=install_weak_deps=false install \
+      dbus-daemon dejavu-sans-fonts desktop-file-utils procps-ng python3 \
+      shadow-utils util-linux xdotool xorg-x11-server-Xvfb xorg-x11-xauth \
+    && dnf clean all
+
+FROM base AS copr
+RUN dnf -y --setopt=install_weak_deps=false install copr-cli curl jq python3 \
+    && dnf clean all

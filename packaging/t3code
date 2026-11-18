@@ -1,0 +1,4 @@
+#!/bin/sh
+export T3CODE_DISABLE_AUTO_UPDATE=true
+unset APPIMAGE APPDIR ELECTRON_RUN_AS_NODE
+exec /usr/lib64/t3code/t3code "$@"

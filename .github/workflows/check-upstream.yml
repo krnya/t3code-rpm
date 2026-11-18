@@ -1,0 +1,75 @@
+name: Track stable upstream releases
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable upstream version or tag, blank for latest or pending'
+        type: string
+        required: false
+      force_rebuild:
+        description: 'Allocate the next RPM revision for a published version'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: t3code-rpm-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    if: github.ref_name == github.event.repository.default_branch && !github.event.repository.fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # GitHub only lists draft releases for callers with push access.
+    outputs:
+      build: ${{ steps.upstream.outputs.build }}
+      resume: ${{ steps.upstream.outputs.resume }}
+      plan: ${{ steps.upstream.outputs.plan }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Identify a stable release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COPR_PROJECT: ${{ vars.COPR_PROJECT }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+          : "${COPR_PROJECT:?Set the COPR_PROJECT repository variable first}"
+          args=(--version "$REQUESTED_VERSION" --output "$GITHUB_OUTPUT")
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then args+=(--manual); fi
+          if [[ $FORCE_REBUILD == true ]]; then args+=(--force); fi
+          python3 scripts/check-upstream.py "${args[@]}"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true' && needs.detect.outputs.resume == 'false'
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      plan: ${{ needs.detect.outputs.plan }}
+
+  publish:
+    needs: [detect, build]
+    if: >-
+      !cancelled() && needs.detect.outputs.build == 'true' &&
+      (needs.build.result == 'success' ||
+       (needs.build.result == 'skipped' && needs.detect.outputs.resume == 'true'))
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      plan: ${{ needs.detect.outputs.plan }}
+      resume: ${{ needs.detect.outputs.resume == 'true' }}
+    secrets:
+      COPR_CONFIG: ${{ secrets.COPR_CONFIG }}

@@ -1,0 +1,71 @@
+name: Publish verified RPMs
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        type: string
+        required: true
+      resume:
+        type: boolean
+        required: true
+    secrets:
+      COPR_CONFIG:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.ref_name == github.event.repository.default_branch && !github.event.repository.fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    env:
+      COPR_PROJECT: ${{ vars.COPR_PROJECT }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: '!inputs.resume'
+        with:
+          name: verified-fedora-45-rpm
+          path: .rpm-work/artifacts/
+      - name: Stage a resumable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          mkdir -p .rpm-work/publish
+          printf '%s\n' "$PLAN" > .rpm-work/plan.json
+          python3 scripts/release-assets.py stage .rpm-work/plan.json .rpm-work/verified .rpm-work/artifacts
+      - name: Prepare isolated publication and test tooling
+        run: |
+          docker build --target copr -f packaging/Containerfile -t t3code-copr packaging
+          docker build --target package-test -f packaging/Containerfile -t t3code-test packaging
+      - name: Submit, monitor, and verify the signed COPR build
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          docker run --rm -e COPR_CONFIG -v "$PWD/.rpm-work:/work" -v "$PWD/scripts:/scripts:ro" \
+            t3code-copr /scripts/publish-copr.sh build "$COPR_PROJECT" /work/verified /work/publish
+      - name: Test the signed COPR candidate
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version .rpm-work/plan.json)
+          revision=$(jq -r .revision .rpm-work/plan.json)
+          docker run --rm --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+            -v "$PWD/.rpm-work/publish:/publish:ro" -v "$PWD/scripts:/scripts:ro" t3code-test \
+            /scripts/test-package.sh "/publish/t3code-$version-$revision.fc45.x86_64.rpm" "$version" "$revision"
+      - name: Promote the tested COPR build and verify repository metadata
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          docker run --rm -e COPR_CONFIG -v "$PWD/.rpm-work:/work" -v "$PWD/scripts:/scripts:ro" \
+            t3code-copr /scripts/publish-copr.sh promote "$COPR_PROJECT" /work/verified /work/publish
+      - name: Publish signed RPM, SRPM, provenance, and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release-assets.py publish .rpm-work/plan.json .rpm-work/verified .rpm-work/publish
